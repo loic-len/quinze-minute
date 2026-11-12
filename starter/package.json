@@ -1,0 +1,24 @@
+{
+  "name": "quinze-minutes",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "migrate": "node lib/migrate.ts"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.9",
+    "fastify": "^5.6.1",
+    "ioredis": "^5.8.2",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.7",
+    "@types/node": "^24.10.0",
+    "@types/pg": "^8.15.6",
+    "typescript": "^5.9.3"
+  }
+}

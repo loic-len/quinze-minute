@@ -1,0 +1,645 @@
+openapi: 3.1.0
+info:
+  title: Quinze Minutes — système d'un groupe
+  version: 1.2.0
+  description: |
+    Ce que **chaque groupe expose** au harnais, sur un point d'entrée unique
+    (`SYSTEM_URL`, port 8080 de la stack du groupe).
+
+    Le harnais joue les clients, le PSP, les restaurants et les livreurs.
+    Tout ce qui n'est pas dans ce fichier est libre : découpage en services,
+    événements internes, bases de données.
+
+    Sémantique, garanties de livraison et invariants : voir `README.md`.
+servers:
+  - url: http://localhost:8080
+    description: point d'entrée de la stack du groupe
+
+# Pas d'authentification : le harnais et la stack partagent un réseau Docker privé.
+security: []
+
+tags:
+  - name: clients
+    description: API publique, appelée par les clients simulés
+  - name: webhooks
+    description: notifications envoyées par les partenaires simulés (at-least-once, ordre non garanti)
+  - name: harnais
+    description: pilotage et vérification par le harnais
+
+paths:
+  /orders:
+    post:
+      tags: [clients]
+      operationId: createOrder
+      summary: Créer une commande
+      description: |
+        Crée la commande et lance le paiement. La réponse n'attend **pas** la
+        confirmation du PSP : le statut initial est `payment_pending`.
+
+        Le client simulé **retente** en cas de timeout ou de 5xx, avec la même
+        `Idempotency-Key`. Même clé + même corps → même réponse (même `orderId`).
+        Même clé + corps différent → 422.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: commande créée (ou rejouée à l'identique)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+        '429':
+          $ref: '#/components/responses/Overloaded'
+        '503':
+          $ref: '#/components/responses/Overloaded'
+
+  /orders/{orderId}:
+    get:
+      tags: [clients]
+      operationId: getOrder
+      summary: Consulter une commande
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: la commande
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Overloaded'
+
+  /orders/{orderId}/events:
+    get:
+      tags: [clients]
+      operationId: streamOrderEvents
+      summary: Suivre une commande en direct (SSE)
+      description: |
+        Flux `text/event-stream`. À la connexion, le système envoie d'abord un
+        événement `status` avec le statut courant, puis chaque changement.
+
+        Types d'événements (champ `event:` du SSE), données en JSON (`data:`) :
+        - `status` → `StatusEvent`
+        - `courier_position` → `CourierPositionEvent`
+        - `eta` → `EtaEvent`
+
+        Le flux se ferme après `delivered` ou `cancelled`. Le harnais mesure la
+        **fraîcheur** : délai entre le webhook partenaire et l'événement SSE.
+        `Last-Event-ID` est facultatif.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: flux d'événements
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: flux SSE ; le `data:` de chaque événement suit le schéma indiqué dans `x-sse-events`
+          x-sse-events:
+            status:
+              $ref: '#/components/schemas/StatusEvent'
+            courier_position:
+              $ref: '#/components/schemas/CourierPositionEvent'
+            eta:
+              $ref: '#/components/schemas/EtaEvent'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Overloaded'
+
+  /webhooks/psp:
+    post:
+      tags: [webhooks]
+      operationId: receivePspEvent
+      summary: Notification du PSP
+      description: |
+        Livrée **au moins une fois**, éventuellement en double, en retard ou
+        dans le désordre (un `payment.succeeded` peut arriver après un
+        `refund.succeeded`). `eventId` est unique par événement : deux livraisons
+        du même événement ont le même `eventId`.
+
+        Répondre 2xx accuse réception. Toute autre réponse, ou aucune réponse en
+        5 s, déclenche une nouvelle livraison (backoff côté PSP).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PspEvent'
+      responses:
+        '204':
+          description: reçu
+        '400':
+          $ref: '#/components/responses/Problem'
+
+  /webhooks/restaurants:
+    post:
+      tags: [webhooks]
+      operationId: receiveRestaurantEvent
+      summary: Notification d'un restaurant
+      description: Mêmes garanties que `/webhooks/psp`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestaurantEvent'
+      responses:
+        '204':
+          description: reçu
+        '400':
+          $ref: '#/components/responses/Problem'
+
+  /webhooks/couriers:
+    post:
+      tags: [webhooks]
+      operationId: receiveCourierEvent
+      summary: Notification d'un livreur (récupération, livraison)
+      description: Mêmes garanties que `/webhooks/psp`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CourierEvent'
+      responses:
+        '204':
+          description: reçu
+        '400':
+          $ref: '#/components/responses/Problem'
+
+  /webhooks/couriers/positions:
+    post:
+      tags: [webhooks]
+      operationId: receiveCourierPositions
+      summary: Positions GPS des livreurs, par lots
+      description: |
+        Envoyé en continu (un lot par seconde environ, tous livreurs confondus).
+        **Pas de nouvelle livraison** en cas d'échec : une position perdue est
+        remplacée par la suivante. Une position plus ancienne que la dernière
+        connue pour un livreur doit être ignorée.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CourierPositionBatch'
+      responses:
+        '204':
+          description: reçu
+        '503':
+          $ref: '#/components/responses/Overloaded'
+
+  /admin/world:
+    post:
+      tags: [harnais]
+      operationId: loadWorld
+      summary: Charger le monde du scénario (et tout remettre à zéro)
+      description: |
+        Appelé par le harnais avant chaque scénario. Efface toutes les commandes,
+        paiements et assignations, puis charge restaurants, menus et livreurs.
+        Le harnais attend ensuite que `/health/ready` réponde 200.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/World'
+      responses:
+        '204':
+          description: monde chargé
+        '400':
+          $ref: '#/components/responses/Problem'
+
+  /audit:
+    get:
+      tags: [harnais]
+      operationId: getAudit
+      summary: État final des commandes, pour le vérificateur
+      description: |
+        Appelé à la fin du scénario, après une période de grâce. Le vérificateur
+        compare ces données au grand livre des partenaires simulés. Paginé par
+        curseur opaque.
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 500
+      responses:
+        '200':
+          description: une page d'audit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditPage'
+
+  /health/live:
+    get:
+      tags: [harnais]
+      operationId: liveness
+      summary: Le process est vivant
+      responses:
+        '200':
+          description: vivant
+        '503':
+          description: à redémarrer
+
+  /health/ready:
+    get:
+      tags: [harnais]
+      operationId: readiness
+      summary: Le système accepte du trafic
+      description: Répond 503 pendant le démarrage et pendant un arrêt en cours (SIGTERM).
+      responses:
+        '200':
+          description: prêt
+        '503':
+          description: pas prêt
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Identifiant unique de l'intention du client (UUID). Conservé au moins 1 h.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 64
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+
+  responses:
+    Problem:
+      description: erreur (RFC 9457)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Overloaded:
+      description: |
+        Surcharge ou limite de débit. **Répondre vite** (refuser plutôt que
+        timeouter). Le client simulé respecte `Retry-After`.
+      headers:
+        Retry-After:
+          description: secondes avant de retenter
+          schema:
+            type: integer
+            minimum: 0
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Id:
+      type: string
+      minLength: 1
+      maxLength: 64
+      description: identifiant opaque (UUID conseillé pour ceux que le système génère)
+    Timestamp:
+      type: string
+      format: date-time
+    AmountCents:
+      type: integer
+      minimum: 0
+      description: montant en centimes d'euro
+    Location:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat:
+          type: number
+          minimum: -90
+          maximum: 90
+        lng:
+          type: number
+          minimum: -180
+          maximum: 180
+
+    OrderStatus:
+      type: string
+      description: |
+        Cycle de vie. Les transitions autorisées sont dans `README.md` ;
+        un statut ne recule jamais.
+      enum:
+        - payment_pending
+        - paid
+        - in_kitchen
+        - ready
+        - picked_up
+        - delivered
+        - cancelled
+
+    CancellationReason:
+      type: string
+      enum:
+        - payment_failed
+        - restaurant_refused
+        - no_courier
+
+    CreateOrderRequest:
+      type: object
+      required: [customerId, restaurantId, items, deliveryLocation]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Id'
+        restaurantId:
+          $ref: '#/components/schemas/Id'
+        items:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            type: object
+            required: [menuItemId, quantity]
+            properties:
+              menuItemId:
+                $ref: '#/components/schemas/Id'
+              quantity:
+                type: integer
+                minimum: 1
+                maximum: 10
+        deliveryLocation:
+          $ref: '#/components/schemas/Location'
+
+    Order:
+      type: object
+      required: [orderId, customerId, restaurantId, status, amountCents, createdAt]
+      properties:
+        orderId:
+          $ref: '#/components/schemas/Id'
+        customerId:
+          $ref: '#/components/schemas/Id'
+        restaurantId:
+          $ref: '#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        cancellationReason:
+          $ref: '#/components/schemas/CancellationReason'
+        amountCents:
+          $ref: '#/components/schemas/AmountCents'
+        courierId:
+          $ref: '#/components/schemas/Id'
+        etaSeconds:
+          type: integer
+          minimum: 0
+          description: estimation du temps restant avant livraison
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    StatusEvent:
+      type: object
+      required: [orderId, status, at]
+      properties:
+        orderId:
+          $ref: '#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        cancellationReason:
+          $ref: '#/components/schemas/CancellationReason'
+        at:
+          $ref: '#/components/schemas/Timestamp'
+    CourierPositionEvent:
+      type: object
+      required: [orderId, courierId, location, at]
+      properties:
+        orderId:
+          $ref: '#/components/schemas/Id'
+        courierId:
+          $ref: '#/components/schemas/Id'
+        location:
+          $ref: '#/components/schemas/Location'
+        at:
+          $ref: '#/components/schemas/Timestamp'
+    EtaEvent:
+      type: object
+      required: [orderId, etaSeconds, at]
+      properties:
+        orderId:
+          $ref: '#/components/schemas/Id'
+        etaSeconds:
+          type: integer
+          minimum: 0
+        at:
+          $ref: '#/components/schemas/Timestamp'
+
+    PspEvent:
+      type: object
+      required: [eventId, type, paymentId, orderId, amountCents, occurredAt]
+      properties:
+        eventId:
+          $ref: '#/components/schemas/Id'
+        type:
+          type: string
+          enum:
+            - payment.succeeded
+            - payment.failed
+            - refund.succeeded
+        paymentId:
+          $ref: '#/components/schemas/Id'
+        refundId:
+          $ref: '#/components/schemas/Id'
+        orderId:
+          $ref: '#/components/schemas/Id'
+        amountCents:
+          $ref: '#/components/schemas/AmountCents'
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    RestaurantEvent:
+      type: object
+      required: [eventId, type, restaurantId, orderId, occurredAt]
+      properties:
+        eventId:
+          $ref: '#/components/schemas/Id'
+        type:
+          type: string
+          enum:
+            - order.ready
+          description: la commande est prête ; elle libère sa place en cuisine
+        restaurantId:
+          $ref: '#/components/schemas/Id'
+        orderId:
+          $ref: '#/components/schemas/Id'
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    CourierEvent:
+      type: object
+      required: [eventId, type, courierId, orderId, occurredAt]
+      properties:
+        eventId:
+          $ref: '#/components/schemas/Id'
+        type:
+          type: string
+          enum:
+            - order.picked_up
+            - order.delivered
+          description: après `order.delivered`, le livreur est de nouveau disponible
+        courierId:
+          $ref: '#/components/schemas/Id'
+        orderId:
+          $ref: '#/components/schemas/Id'
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    CourierPositionBatch:
+      type: object
+      required: [positions]
+      properties:
+        positions:
+          type: array
+          items:
+            type: object
+            required: [courierId, location, at]
+            properties:
+              courierId:
+                $ref: '#/components/schemas/Id'
+              location:
+                $ref: '#/components/schemas/Location'
+              at:
+                $ref: '#/components/schemas/Timestamp'
+
+    World:
+      type: object
+      required: [restaurants, couriers]
+      properties:
+        restaurants:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [restaurantId, name, location, kitchenCapacity, menu]
+            properties:
+              restaurantId:
+                $ref: '#/components/schemas/Id'
+              name:
+                type: string
+              location:
+                $ref: '#/components/schemas/Location'
+              kitchenCapacity:
+                type: integer
+                minimum: 1
+                description: nombre maximal de commandes en cuisine en même temps (statut `in_kitchen`)
+              menu:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  required: [menuItemId, name, priceCents]
+                  properties:
+                    menuItemId:
+                      $ref: '#/components/schemas/Id'
+                    name:
+                      type: string
+                    priceCents:
+                      $ref: '#/components/schemas/AmountCents'
+        couriers:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [courierId, location]
+            properties:
+              courierId:
+                $ref: '#/components/schemas/Id'
+              location:
+                $ref: '#/components/schemas/Location'
+
+    AuditOrder:
+      type: object
+      required: [orderId, idempotencyKey, status, amountCents, payments, statusHistory]
+      properties:
+        orderId:
+          $ref: '#/components/schemas/Id'
+        idempotencyKey:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        cancellationReason:
+          $ref: '#/components/schemas/CancellationReason'
+        amountCents:
+          $ref: '#/components/schemas/AmountCents'
+        restaurantId:
+          $ref: '#/components/schemas/Id'
+        courierId:
+          $ref: '#/components/schemas/Id'
+        payments:
+          type: array
+          description: tous les paiements demandés au PSP pour cette commande, y compris échoués ou remboursés
+          items:
+            type: object
+            required: [paymentId, status]
+            properties:
+              paymentId:
+                $ref: '#/components/schemas/Id'
+              status:
+                type: string
+                enum: [pending, succeeded, failed, refunded]
+        statusHistory:
+          type: array
+          description: statuts successifs, dans l'ordre où le système les a appliqués
+          items:
+            type: object
+            required: [status, at]
+            properties:
+              status:
+                $ref: '#/components/schemas/OrderStatus'
+              at:
+                $ref: '#/components/schemas/Timestamp'
+
+    AuditPage:
+      type: object
+      required: [orders]
+      properties:
+        orders:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditOrder'
+        nextCursor:
+          type: string
+          description: absent sur la dernière page
+
+    Problem:
+      type: object
+      description: RFC 9457
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string

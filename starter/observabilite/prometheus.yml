@@ -1,0 +1,15 @@
+# Prometheus interroge GET /metrics sur le port HTTP de chaque service applicatif.
+# Ajoutez ici vos propres services si vous redécoupez la stack.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: commandes
+    static_configs: [{ targets: ['commandes:3000'] }]
+  - job_name: paiement
+    static_configs: [{ targets: ['paiement:3000'] }]
+  - job_name: dispatch
+    static_configs: [{ targets: ['dispatch:3000'] }]
+  - job_name: suivi
+    static_configs: [{ targets: ['suivi:3000'] }]

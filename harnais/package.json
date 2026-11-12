@@ -1,0 +1,22 @@
+{
+  "name": "quinze-minutes-harnais",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "start": "node src/main.ts",
+    "smoke": "node src/smoke.ts",
+    "run": "node src/run.ts",
+    "check-report": "node src/check-report.ts"
+  },
+  "dependencies": {
+    "fastify": "^5.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3"
+  }
+}

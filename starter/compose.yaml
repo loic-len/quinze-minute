@@ -1,0 +1,196 @@
+name: quinze-minutes
+
+# Budget de ressources de la stack (contrat, « Branchement ») : 4 CPU et 4 Go au total pour tous les
+# conteneurs en marche, hors harnais et observabilité. Répartissez-le comme vous voulez, mais chaque
+# conteneur doit avoir une limite : le harnais vérifie la somme à chaque passage.
+#
+# Labels lus par le harnais (voir contrat/README.md, « Pannes provoquées par le harnais ») :
+#   quinze.role=infra          jamais redémarré au hasard (bases, bus, gateway…)
+#   quinze.infra=<nature>      cible des arrêts d'infrastructure (ex. redis)
+#   quinze.role=observability  hors budget, jamais touché
+#   sans label quinze.role     conteneur applicatif : peut être redémarré ou tué
+#
+# Inspecteur de Node (profilage CPU, mémoire) ouvert sur chaque service, publié sur votre machine
+# seulement (127.0.0.1) : commandes 9229, paiement 9230, dispatch 9231, suivi 9232.
+# Dans Chrome : chrome://inspect → Configure… → ajouter ces adresses.
+
+x-service-env: &service-env
+  PORT: "3000"
+  DATABASE_URL: postgres://quinze:quinze@postgres:5432/quinze
+  AMQP_URL: amqp://quinze:quinze@rabbitmq:5672
+  REDIS_URL: redis://redis:6379
+  PARTNERS_URL: http://harness:9000
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+
+x-service: &service
+  build: .
+  restart: unless-stopped
+  deploy:
+    resources:
+      limits: { cpus: "0.5", memory: 512M }
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    rabbitmq:
+      condition: service_healthy
+    redis:
+      condition: service_started
+
+services:
+  gateway:
+    image: nginx:1.27-alpine
+    labels:
+      quinze.role: infra
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M }
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      - commandes
+      - paiement
+      - dispatch
+      - suivi
+
+  commandes:
+    <<: *service
+    command: ["node", "--inspect=0.0.0.0:9229", "services/commandes/main.ts"]
+    environment: { <<: *service-env, OTEL_SERVICE_NAME: commandes }
+    ports:
+      - "127.0.0.1:9229:9229"
+
+  paiement:
+    <<: *service
+    command: ["node", "--inspect=0.0.0.0:9229", "services/paiement/main.ts"]
+    environment: { <<: *service-env, OTEL_SERVICE_NAME: paiement }
+    ports:
+      - "127.0.0.1:9230:9229"
+
+  dispatch:
+    <<: *service
+    command: ["node", "--inspect=0.0.0.0:9229", "services/dispatch/main.ts"]
+    environment: { <<: *service-env, OTEL_SERVICE_NAME: dispatch }
+    ports:
+      - "127.0.0.1:9231:9229"
+
+  suivi:
+    <<: *service
+    command: ["node", "--inspect=0.0.0.0:9229", "services/suivi/main.ts"]
+    environment: { <<: *service-env, OTEL_SERVICE_NAME: suivi }
+    ports:
+      - "127.0.0.1:9232:9229"
+
+  migrate:
+    build: .
+    command: ["node", "lib/migrate.ts"]
+    labels:
+      quinze.role: infra
+    environment:
+      DATABASE_URL: postgres://quinze:quinze@postgres:5432/quinze
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    labels:
+      quinze.role: infra
+      quinze.infra: postgres
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }
+    environment:
+      POSTGRES_USER: quinze
+      POSTGRES_PASSWORD: quinze
+      POSTGRES_DB: quinze
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quinze -d quinze"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    labels:
+      quinze.role: infra
+      quinze.infra: redis
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 256M }
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    labels:
+      quinze.role: infra
+      quinze.infra: rabbitmq
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+    environment:
+      RABBITMQ_DEFAULT_USER: quinze
+      RABBITMQ_DEFAULT_PASS: quinze
+    ports:
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # --- Observabilité (hors budget) : Grafana sur http://localhost:3001 ---
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    labels:
+      quinze.role: observability
+    volumes:
+      - ./observabilite/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  tempo:
+    image: grafana/tempo:2.8.1
+    labels:
+      quinze.role: observability
+    user: root
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observabilite/tempo.yaml:/etc/tempo.yaml:ro
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    labels:
+      quinze.role: observability
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./observabilite/grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - ./observabilite/grafana/dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./observabilite/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+      - tempo
+
+  # --- Harnais : partenaires simulés, clients (k6), pannes, vérificateur, page live sur :9000 ---
+  # Version de développement construite depuis ../harnais ; les groupes recevront une image publiée.
+  harness:
+    build: ../harnais
+    labels:
+      quinze.role: harness
+    environment:
+      SYSTEM_URL: http://gateway:8080
+      HARNESS_URL: http://harness:9000
+      COMPOSE_PROJECT: quinze-minutes
+    volumes:
+      # Pour redémarrer, tuer ou arrêter les conteneurs du projet pendant les paliers.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Rapports signés de chaque passage.
+      - ./rapports:/reports
+    ports:
+      - "9000:9000"

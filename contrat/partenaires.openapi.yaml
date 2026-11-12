@@ -1,0 +1,310 @@
+openapi: 3.1.0
+info:
+  title: Quinze Minutes — partenaires simulés (harnais)
+  version: 1.2.0
+  description: |
+    Ce que **le harnais expose** et que le système d'un groupe appelle
+    (`PARTNERS_URL`, injecté par variable d'environnement).
+
+    Les partenaires simulés tiennent leur propre grand livre : ils détectent
+    eux-mêmes un double débit, une cuisine en surcapacité ou un livreur assigné
+    deux fois, sans faire confiance à `/audit`.
+
+    Selon le scénario, chacun peut ralentir, échouer, renvoyer des doublons ou
+    tomber. Sémantique et invariants : voir `README.md`.
+servers:
+  - url: http://harness:9000
+    description: harnais, sur le réseau Docker de la stack
+
+# Pas d'authentification : le harnais et la stack partagent un réseau Docker privé.
+security: []
+
+tags:
+  - name: psp
+    description: prestataire de paiement simulé
+  - name: restaurants
+    description: cuisines simulées
+  - name: couriers
+    description: livreurs simulés
+  - name: diagnostics
+    description: réponses attendues par certains paliers
+
+paths:
+  /psp/payments:
+    post:
+      tags: [psp]
+      operationId: createPayment
+      summary: Débiter un client
+      description: |
+        Asynchrone : la réponse dit seulement que la demande est prise en
+        compte. Le résultat arrive par webhook (`payment.succeeded` ou
+        `payment.failed`) sur `/webhooks/psp`.
+
+        **Idempotent sur `Idempotency-Key`**, comme un vrai PSP : même clé →
+        même `paymentId`, aucun nouveau débit. Une clé différente crée un
+        nouveau paiement, donc potentiellement **un double débit**.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, customerId, amountCents]
+              properties:
+                orderId:
+                  $ref: '#/components/schemas/Id'
+                customerId:
+                  $ref: '#/components/schemas/Id'
+                amountCents:
+                  $ref: '#/components/schemas/AmountCents'
+      responses:
+        '202':
+          description: paiement en cours
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [paymentId, status]
+                properties:
+                  paymentId:
+                    $ref: '#/components/schemas/Id'
+                  status:
+                    type: string
+                    enum: [pending, succeeded, failed]
+                    description: statut connu au moment de la réponse (rejeu d'une clé déjà traitée)
+        '422':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /psp/refunds:
+    post:
+      tags: [psp]
+      operationId: createRefund
+      summary: Rembourser un paiement réussi
+      description: |
+        Asynchrone, résultat par webhook `refund.succeeded`. Idempotent sur
+        `Idempotency-Key`. Rembourser un paiement non réussi → 409.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paymentId]
+              properties:
+                paymentId:
+                  $ref: '#/components/schemas/Id'
+      responses:
+        '202':
+          description: remboursement en cours
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [refundId]
+                properties:
+                  refundId:
+                    $ref: '#/components/schemas/Id'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /restaurants/{restaurantId}/orders:
+    post:
+      tags: [restaurants]
+      operationId: sendToKitchen
+      summary: Envoyer une commande payée en cuisine
+      description: |
+        Synchrone. Idempotent sur `orderId` : renvoyer la même commande répond
+        200 sans occuper une place de plus.
+
+        La commande occupe une place en cuisine jusqu'au webhook `order.ready`.
+        Si la cuisine est déjà pleine (`kitchenCapacity` du monde), le
+        restaurant répond 409 `kitchen_full` **et enregistre une violation
+        d'invariant** : le système doit suivre la capacité lui-même.
+
+        Un restaurant peut refuser une commande (422 `refused`, rupture de stock) :
+        la commande doit alors être annulée et remboursée.
+      parameters:
+        - name: restaurantId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, items]
+              properties:
+                orderId:
+                  $ref: '#/components/schemas/Id'
+                items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [menuItemId, quantity]
+                    properties:
+                      menuItemId:
+                        $ref: '#/components/schemas/Id'
+                      quantity:
+                        type: integer
+                        minimum: 1
+      responses:
+        '200':
+          description: acceptée en cuisine
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [orderId, estimatedReadyAt]
+                properties:
+                  orderId:
+                    $ref: '#/components/schemas/Id'
+                  estimatedReadyAt:
+                    type: string
+                    format: date-time
+        '409':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /couriers/{courierId}/assignments:
+    post:
+      tags: [couriers]
+      operationId: assignCourier
+      summary: Assigner une course à un livreur
+      description: |
+        Synchrone. Idempotent sur `orderId` pour un même livreur.
+
+        Le livreur est occupé de l'assignation jusqu'à son webhook
+        `order.delivered`. Assigner un livreur occupé → 409 `courier_busy`
+        **et une violation d'invariant enregistrée**.
+
+        Le livreur va au restaurant, attend `order.ready` si besoin, puis livre.
+        Ses positions arrivent sur `/webhooks/couriers/positions`.
+      parameters:
+        - name: courierId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, restaurantId, deliveryLocation]
+              properties:
+                orderId:
+                  $ref: '#/components/schemas/Id'
+                restaurantId:
+                  $ref: '#/components/schemas/Id'
+                deliveryLocation:
+                  $ref: '#/components/schemas/Location'
+      responses:
+        '201':
+          description: course acceptée
+        '409':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /diagnostics/slow-restaurant:
+    post:
+      tags: [diagnostics]
+      operationId: reportSlowRestaurant
+      summary: Désigner le restaurant lent (palier 2)
+      description: |
+        Une seule réponse comptée par scénario : la dernière reçue. La trace
+        citée sert au post-mortem, elle n'est pas vérifiée automatiquement.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [restaurantId]
+              properties:
+                restaurantId:
+                  $ref: '#/components/schemas/Id'
+                traceId:
+                  type: string
+                  description: identifiant d'une trace qui montre la lenteur
+      responses:
+        '204':
+          description: enregistré
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 64
+
+  responses:
+    Problem:
+      description: erreur métier (RFC 9457) ; `type` vaut `kitchen_full`, `refused`, `courier_busy`, `not_refundable`…
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unavailable:
+      description: partenaire indisponible (panne simulée) ; peut aussi ne jamais répondre
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 0
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Id:
+      type: string
+      minLength: 1
+      maxLength: 64
+    AmountCents:
+      type: integer
+      minimum: 0
+    Location:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat:
+          type: number
+          minimum: -90
+          maximum: 90
+        lng:
+          type: number
+          minimum: -180
+          maximum: 180
+    Problem:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string

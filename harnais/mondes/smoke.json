@@ -1,0 +1,36 @@
+{
+  "restaurants": [
+    {
+      "restaurantId": "r-pizza-bastille",
+      "name": "Pizza Bastille",
+      "location": { "lat": 48.8532, "lng": 2.3692 },
+      "kitchenCapacity": 6,
+      "menu": [
+        { "menuItemId": "m-margherita", "name": "Margherita", "priceCents": 1100 },
+        { "menuItemId": "m-reine", "name": "Reine", "priceCents": 1300 }
+      ]
+    },
+    {
+      "restaurantId": "r-burger-nation",
+      "name": "Burger Nation",
+      "location": { "lat": 48.8483, "lng": 2.3958 },
+      "kitchenCapacity": 4,
+      "menu": [
+        { "menuItemId": "m-classic", "name": "Classic", "priceCents": 1250 },
+        { "menuItemId": "m-frites", "name": "Frites", "priceCents": 400 }
+      ]
+    }
+  ],
+  "couriers": [
+    { "courierId": "c-001", "location": { "lat": 48.8510, "lng": 2.3750 } },
+    { "courierId": "c-002", "location": { "lat": 48.8495, "lng": 2.3850 } },
+    { "courierId": "c-003", "location": { "lat": 48.8560, "lng": 2.3700 } },
+    { "courierId": "c-004", "location": { "lat": 48.8530, "lng": 2.3800 } },
+    { "courierId": "c-005", "location": { "lat": 48.8470, "lng": 2.3900 } },
+    { "courierId": "c-006", "location": { "lat": 48.8550, "lng": 2.3650 } },
+    { "courierId": "c-007", "location": { "lat": 48.8500, "lng": 2.3720 } },
+    { "courierId": "c-008", "location": { "lat": 48.8520, "lng": 2.3920 } },
+    { "courierId": "c-009", "location": { "lat": 48.8490, "lng": 2.3780 } },
+    { "courierId": "c-010", "location": { "lat": 48.8540, "lng": 2.3860 } }
+  ]
+}

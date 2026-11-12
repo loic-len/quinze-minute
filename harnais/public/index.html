@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quinze Minutes · harnais</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3; --muted: #8b949e;
+    --demand: #58a6ff; --accepted: #3fb950; --bad: #f85149; --warn: #d29922; --ok: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .02em; }
+  h1 small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+  .spacer { flex: 1; }
+  select, button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font: inherit; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  main { padding: 20px 24px; display: grid; gap: 16px; grid-template-columns: repeat(12, 1fr); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .span-12 { grid-column: span 12; } .span-8 { grid-column: span 8; } .span-4 { grid-column: span 4; } .span-3 { grid-column: span 3; }
+  @media (max-width: 900px) { .span-8, .span-4, .span-3 { grid-column: span 12; } }
+  .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+  .big { font-size: 40px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .phase { font-size: 28px; font-weight: 700; }
+  .clock { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; margin-top: 10px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--demand); width: 0; transition: width 1s linear; }
+  canvas { width: 100%; height: 260px; display: block; }
+  .legend { display: flex; gap: 16px; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .inv { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .inv:last-child { border-bottom: 0; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  .fault { background: rgba(248, 81, 73, .15); color: var(--bad); border-radius: 6px; padding: 6px 10px; margin: 4px 0; font-weight: 600; }
+  .log { color: var(--muted); font-size: 13px; margin: 2px 0; }
+  .verdict { font-size: 32px; font-weight: 800; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 6px 4px; border-bottom: 1px solid var(--line); }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Quinze Minutes <small id="title">—</small></h1>
+  <span class="spacer"></span>
+  <select id="scenario" aria-label="Scénario"></select>
+  <button id="start">Lancer</button>
+</header>
+<main>
+  <section class="card span-4">
+    <div class="label">Phase</div>
+    <div class="phase" id="phase">En attente</div>
+    <div class="clock" id="clock">0 / 0 s</div>
+    <div class="bar"><div id="progress"></div></div>
+  </section>
+  <section class="card span-4">
+    <div class="label">Commandes livrées (score provisoire)</div>
+    <div class="big" id="delivered">0</div>
+    <div class="clock" id="counts">—</div>
+  </section>
+  <section class="card span-4">
+    <div class="label">p99 de POST /orders (10 dernières s)</div>
+    <div class="big" id="p99">—</div>
+    <div class="clock" id="violations">aucune violation</div>
+  </section>
+
+  <section class="card span-8">
+    <div class="legend">
+      <span><span class="dot" style="background: var(--demand)"></span>clients par seconde</span>
+      <span><span class="dot" style="background: var(--accepted)"></span>commandes acceptées</span>
+    </div>
+    <canvas id="chart" width="1200" height="260"></canvas>
+  </section>
+  <section class="card span-4">
+    <div class="label">Pannes en cours</div>
+    <div id="faults"><div class="log">aucune</div></div>
+    <div class="label" style="margin-top: 14px">Chronologie</div>
+    <div id="chaos"></div>
+  </section>
+
+  <section class="card span-12" id="result" hidden>
+    <div class="verdict" id="verdict"></div>
+    <div class="clock" id="score"></div>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 12px">
+      <table id="criteria"></table>
+      <table id="invariants"></table>
+    </div>
+  </section>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const fmt = (n) => (n === undefined || n === null ? '—' : String(n));
+
+  fetch('/_harness/scenarios').then((r) => r.json()).then((list) => {
+    for (const s of list) $('scenario').add(new Option(s.title, s.name));
+  });
+
+  $('start').onclick = async () => {
+    const response = await fetch('/_harness/runs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scenario: $('scenario').value }),
+    });
+    if (response.status !== 202) alert((await response.json()).error);
+  };
+
+  function draw(series, total) {
+    const canvas = $('chart');
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height, pad = 30;
+    ctx.clearRect(0, 0, w, h);
+    const n = Math.max(total, series.demand.length, 1);
+    const max = Math.max(5, ...series.demand) * 1.15;
+    ctx.strokeStyle = '#30363d'; ctx.fillStyle = '#8b949e'; ctx.font = '12px system-ui';
+    for (let i = 0; i <= 4; i++) {
+      const y = h - pad - ((h - 2 * pad) * i) / 4;
+      ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(w - 10, y); ctx.stroke();
+      ctx.fillText(Math.round((max * i) / 4), 2, y + 4);
+    }
+    const line = (values, color) => {
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+      values.forEach((v, i) => {
+        const x = pad + ((w - pad - 10) * i) / n;
+        const y = h - pad - ((h - 2 * pad) * v) / max;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    };
+    line(series.demand, '#58a6ff');
+    line(series.accepted, '#3fb950');
+  }
+
+  function render(s) {
+    $('title').textContent = s.scenario ? s.scenario.title : '';
+    const running = ['preparing', 'running', 'grace', 'verifying'].includes(s.status);
+    $('start').disabled = running;
+    const labels = { idle: 'En attente', preparing: 'Préparation…', verifying: 'Vérification…', done: 'Terminé', error: 'Erreur' };
+    $('phase').textContent = s.status === 'running' || s.status === 'grace' ? (s.phase || '—') : labels[s.status] || s.status;
+    $('clock').textContent = `${s.elapsed} / ${s.total} s`;
+    $('progress').style.width = s.total ? `${Math.min(100, (100 * s.elapsed) / s.total)}%` : '0';
+    $('delivered').textContent = s.totals.delivered;
+    $('counts').textContent = `${s.totals.clients} clients · ${s.totals.accepted} acceptées · ${s.totals.shed} refusées (503) · ${s.totals.failed} en échec`;
+    $('p99').textContent = s.p99Last10s === undefined ? '—' : `${s.p99Last10s} ms`;
+    $('p99').className = 'big ' + (s.p99Last10s > 1000 ? 'bad' : s.p99Last10s > 500 ? 'warn' : '');
+    $('violations').textContent = s.violations ? `${s.violations} violation(s) vue(s) en direct` : 'aucune violation vue en direct';
+    $('violations').className = 'clock ' + (s.violations ? 'bad' : 'ok');
+    $('faults').innerHTML = s.faults.length ? s.faults.map((f) => `<div class="fault">⚡ ${f}</div>`).join('') : '<div class="log">aucune</div>';
+    $('chaos').innerHTML = s.chaosLog.map((c) => `<div class="log">${c.at} s · ${c.label}${c.error ? ' (non joué)' : ''}</div>`).join('');
+    draw(s.series, s.total);
+
+    const r = s.report;
+    $('result').hidden = !r && s.status !== 'error';
+    if (s.status === 'error') {
+      $('verdict').textContent = 'Passage interrompu';
+      $('verdict').className = 'verdict bad';
+      $('score').textContent = s.error;
+    }
+    if (r) {
+      $('verdict').textContent = r.passed ? 'Palier franchi' : 'Palier non franchi';
+      $('verdict').className = 'verdict ' + (r.passed ? 'ok' : 'bad');
+      $('score').textContent = `Score : ${r.score} commandes livrées`;
+      $('criteria').innerHTML = r.criteria.map((c) => `<tr><td class="${c.ok ? 'ok' : 'bad'}">${c.ok ? '✔' : '✘'} ${c.name}</td><td>${c.value} <span class="log">(${c.threshold})</span></td></tr>`).join('');
+      $('invariants').innerHTML = r.invariants.map((i) => `<tr><td class="${!i.violations ? 'ok' : i.blocking ? 'bad' : 'warn'}">${i.violations ? '✘' : '✔'} ${i.id}. ${i.name}${i.blocking ? '' : ' <span class="log">(non bloquant)</span>'}</td><td>${i.violations}</td></tr>`).join('');
+    }
+  }
+
+  const live = new EventSource('/_harness/live');
+  live.onmessage = (e) => render(JSON.parse(e.data));
+</script>
+</body>
+</html>
